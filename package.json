@@ -28,7 +28,8 @@
     "prepare": "pnpm build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run src",
-    "lint": "biome check ."
+    "lint": "biome check .",
+    "prepublishOnly": "pnpm lint && pnpm typecheck && pnpm test && pnpm build"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",
@@ -37,5 +38,26 @@
     "tsx": "4.23.13",
     "typescript": "5.9.3",
     "vitest": "5.0.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wrenautomation/mailifier.git"
+  },
+  "homepage": "https://github.com/wrenautomation/mailifier#readme",
+  "bugs": {
+    "url": "https://github.com/wrenautomation/mailifier/issues"
+  },
+  "keywords": [
+    "email",
+    "verification",
+    "smtp",
+    "mailbox",
+    "deliverability",
+    "bounce",
+    "mx",
+    "rcpt"
+  ],
+  "publishConfig": {
+    "access": "public"
   }
 }
