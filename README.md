@@ -70,7 +70,8 @@ stops.
 
 `GET /healthz` → `{ ok, in_flight, port_25 }`.
 
-`pnpm bundle` writes `dist/mailifier.mjs`, one file to drop on a box with no npm.
+The published package also carries `dist/mailifier.mjs`: the whole server in one file,
+to drop on a box that has node and no npm. `pnpm bundle` rebuilds it.
 
 ## Being a good guest
 

@@ -29,7 +29,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run src",
     "lint": "biome check .",
-    "prepublishOnly": "pnpm lint && pnpm typecheck && pnpm test && pnpm build"
+    "prepublishOnly": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm bundle"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",
