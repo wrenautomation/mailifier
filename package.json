@@ -24,13 +24,13 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node scripts/clean.mjs && tsc -p tsconfig.build.json",
     "bundle": "node scripts/bundle.mjs",
-    "prepare": "pnpm build",
+    "prepare": "pnpm build && pnpm bundle",
     "typecheck": "tsc --noEmit",
     "test": "vitest run src",
     "lint": "biome check .",
-    "prepublishOnly": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm bundle"
+    "prepublishOnly": "pnpm lint && pnpm typecheck && pnpm test"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",
