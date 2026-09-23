@@ -1,0 +1,6 @@
+#!/bin/sh
+# CI's first gates before a push: lint/format and types. Every red CI run so far
+# was one of these. Fix with `pnpm biome check --write .`; skip with --no-verify.
+set -e
+pnpm -s lint
+pnpm -s typecheck

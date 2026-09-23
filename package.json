@@ -26,7 +26,7 @@
   "scripts": {
     "build": "node scripts/clean.mjs && tsc -p tsconfig.build.json",
     "bundle": "node scripts/bundle.mjs",
-    "prepare": "pnpm build && pnpm bundle",
+    "prepare": "git config core.hooksPath .githooks || true && pnpm build && pnpm bundle",
     "typecheck": "tsc --noEmit",
     "test": "vitest run src",
     "lint": "biome check .",
