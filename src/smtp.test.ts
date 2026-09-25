@@ -1,7 +1,7 @@
 /** The SMTP handshake read as verdicts, over scripted conversations (no sockets). */
 
 import { describe, expect, it } from "vitest";
-import type { Resolver } from "./dns.js";
+import { DohError, DohStatusError, type Resolver } from "./dns.js";
 import {
   bigProviderLanes,
   type Conversation,
@@ -195,6 +195,27 @@ describe("SmtpProbe", () => {
     });
     await Promise.all(["a", "b", "c", "d", "e", "f"].map((u) => v.verify(`${u}@acme.example`)));
     expect(peak).toBe(3);
+  });
+
+  it("reads a domain's broken DNS as risky, but a dead resolver as an error", async () => {
+    const probe = (err: Error) =>
+      new SmtpProbe({
+        helo: "probe.test",
+        resolver: async () => {
+          throw err;
+        },
+        sleep: async () => {},
+        dial: async () => {
+          throw new Error("never dialed");
+        },
+      });
+    const v = await probe(new DohStatusError("DNS status 2 for MX broken.example")).verify(
+      "a@broken.example",
+    );
+    expect(v).toMatchObject({ result: "risky", raw: { reason: "dns_error", mx: null } });
+    await expect(probe(new DohError("HTTP 429")).verify("a@broken.example")).rejects.toThrow(
+      DohError,
+    );
   });
 
   it("knows the big shared fleets by host name", () => {

@@ -16,7 +16,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
-import { resolve as dohResolve, type Resolver } from "./dns.js";
+import { DohStatusError, resolve as dohResolve, type Resolver } from "./dns.js";
 import type { MailboxProbe, MailboxResult, Verdict } from "./verdict.js";
 
 export const SMTP_PORT = 25;
@@ -34,7 +34,7 @@ export interface Exchange {
 /** What the wire said, before it is read as a verdict. */
 export interface ProbeOutcome {
   result: MailboxResult;
-  /** Why, in one word: accepted, rejected, catch_all, greylisted, blocked, unreachable, no_mx. */
+  /** Why, in one word: accepted, rejected, catch_all, greylisted, blocked, unreachable, no_mx, dns_error. */
   reason: string;
   mx: string | null;
   /** The RCPT reply for the address itself, when one was given. */
@@ -177,8 +177,14 @@ export async function probeMailbox(email: string, opts: SmtpProbeOptions): Promi
     random: opts.random ?? (() => `wren-${randomBytes(6).toString("hex")}`),
   };
   const domain = email.slice(email.lastIndexOf("@") + 1).toLowerCase();
-  const hosts = await mailHosts(domain, resolver);
   const transcript: Exchange[] = [];
+  let hosts: string[];
+  try {
+    hosts = await mailHosts(domain, resolver);
+  } catch (err) {
+    if (err instanceof DohStatusError) return dnsError(err, transcript);
+    throw err;
+  }
   if (hosts.length === 0)
     return { result: "invalid", reason: "no_mx", mx: null, code: null, transcript };
 
@@ -208,6 +214,19 @@ export async function probeMailbox(email: string, opts: SmtpProbeOptions): Promi
   }
   return { result: "risky", reason: lastReason, mx: null, code: null, transcript };
 }
+
+/**
+ * The resolver answered but the domain's DNS is broken (SERVFAIL, REFUSED): about the
+ * domain, not the prober, so a risky verdict to retry later, not an error. A resolver
+ * that cannot be reached at all stays an error: every probe would fail the same way.
+ */
+const dnsError = (err: DohStatusError, transcript: Exchange[]): ProbeOutcome => ({
+  result: "risky",
+  reason: "dns_error",
+  mx: null,
+  code: null,
+  transcript: [...transcript, { sent: null, code: 0, reply: err.message }],
+});
 
 const errorName = (err: unknown) =>
   err instanceof Error
@@ -317,7 +336,14 @@ export class SmtpProbe implements MailboxProbe {
     const domain = email.slice(email.lastIndexOf("@") + 1).toLowerCase();
     const resolver = this.opts.resolver ?? ((n, t) => dohResolve(n, t));
     // The queue key is the primary MX: what we are actually about to knock on.
-    const host = (await mailHosts(domain, resolver))[0] ?? domain;
+    let hosts: string[];
+    try {
+      hosts = await mailHosts(domain, resolver);
+    } catch (err) {
+      if (err instanceof DohStatusError) return this.verdictOf(dnsError(err, []));
+      throw err;
+    }
+    const host = hosts[0] ?? domain;
     // Round-robin over the host's lanes; each lane is its own queue with its own gap.
     const turns = this.turnsByHost.get(host) ?? 0;
     this.turnsByHost.set(host, turns + 1);
@@ -335,7 +361,10 @@ export class SmtpProbe implements MailboxProbe {
         () => undefined,
       ),
     );
-    const outcome = await turn;
+    return this.verdictOf(await turn);
+  }
+
+  private verdictOf(outcome: ProbeOutcome): Verdict {
     return {
       result: outcome.result,
       raw: {

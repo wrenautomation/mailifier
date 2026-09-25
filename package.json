@@ -1,6 +1,6 @@
 {
   "name": "mailifier",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "packageManager": "pnpm@9.15.0",
   "description": "Ask a mail server whether an address exists, over SMTP, without sending anything.",
   "type": "module",
