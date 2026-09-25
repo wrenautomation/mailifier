@@ -2,8 +2,8 @@
 import { makeProbeServer } from "./server.js";
 /**
  * Serve the probe on PROBE_PORT (2525). Env: PROBE_TOKEN (required), PROBE_HELO
- * (required), PROBE_HOST_GAP_MS, PROBE_CANARY_HOST (an MX known to answer; default
- * Google's inbound).
+ * (required), PROBE_HOST_GAP_MS, PROBE_MAX_IN_FLIGHT (calls at once, default 8),
+ * PROBE_CANARY_HOST (an MX known to answer; default Google's inbound).
  */
 import { dialTcp, SMTP_PORT, SmtpProbe } from "./smtp.js";
 
@@ -46,6 +46,7 @@ const server = makeProbeServer({
   probe,
   token,
   canary: port25Open,
+  maxInFlight: Number(process.env.PROBE_MAX_IN_FLIGHT ?? 8),
   log: (line) => console.log(new Date().toISOString(), line),
 });
 server.listen(port, () => console.log(`mailifier listening on :${port} as ${helo}`));
