@@ -50,4 +50,32 @@ describe("RemoteProbe", () => {
     expect(err).toBeInstanceOf(RemoteProbeError);
     expect(String(err)).not.toContain("tok-123");
   });
+
+  it("waits out a busy server and returns the verdict once a slot frees", async () => {
+    const statuses = [429, 429, 200];
+    const waits: number[] = [];
+    const fetchImpl: FetchLike = async () => {
+      const status = statuses.shift() ?? 200;
+      const body = status === 429 ? { error: "busy" } : { result: "valid", raw: {} };
+      return new Response(JSON.stringify(body), { status });
+    };
+    const probe = new RemoteProbe("http://box", "tok-123", fetchImpl, {
+      busyBackoffMs: [5, 10, 20],
+      sleep: async (ms) => {
+        waits.push(ms);
+      },
+    });
+    expect((await probe.verify("jane@foo.com")).result).toBe("valid");
+    expect(waits).toEqual([5, 10]);
+  });
+
+  it("gives up with busy once the waits run out", async () => {
+    const probe = new RemoteProbe(
+      "http://box",
+      "tok-123",
+      async () => new Response(JSON.stringify({ error: "busy" }), { status: 429 }),
+      { busyBackoffMs: [1, 1], sleep: async () => {} },
+    );
+    await expect(probe.verify("jane@foo.com")).rejects.toThrow(/429: busy/);
+  });
 });

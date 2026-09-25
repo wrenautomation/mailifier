@@ -63,7 +63,8 @@ const probe = new RemoteProbe(process.env.PROBE_URL, process.env.PROBE_TOKEN);
 Both satisfy `MailboxProbe`, so the calling code never knows which one it has.
 
 The server is bearer-authenticated, caps calls in flight (`PROBE_MAX_IN_FLIGHT`,
-default 8; beyond it **429**), and runs a canary before
+default 8; beyond it **429**; `RemoteProbe` waits and retries a 429 for about a minute
+before it gives up), and runs a canary before
 every verdict: if port 25 is not open from this host it answers **503**, never a
 `risky` verdict. A closed port is the host's problem, not the mailbox's — and a
 verifier that quietly reports `risky` for a working mailbox is worse than one that

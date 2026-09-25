@@ -12,19 +12,45 @@ export class RemoteProbeError extends Error {
   override name = "RemoteProbeError";
 }
 
+export interface RemoteProbeSettings {
+  /** Waits before each retry of a 429 "busy" (the server is at PROBE_MAX_IN_FLIGHT). */
+  busyBackoffMs?: readonly number[];
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** ~60s of waiting: a busy server frees a slot as soon as any probe in flight ends. */
+const BUSY_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
+
 export class RemoteProbe implements MailboxProbe {
   readonly name = "smtp";
   private readonly base: string;
+  private readonly busyBackoffMs: readonly number[];
+  private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(
     baseUrl: string,
     private readonly token: string,
     private readonly fetchImpl: FetchLike = fetch,
+    settings: RemoteProbeSettings = {},
   ) {
     this.base = baseUrl.replace(/\/+$/, "");
+    this.busyBackoffMs = settings.busyBackoffMs ?? BUSY_BACKOFF_MS;
+    this.sleep = settings.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   }
 
+  /** Busy is backpressure, not failure: wait and ask again, and only then give up. */
   async verify(email: string): Promise<Verdict> {
+    for (const wait of this.busyBackoffMs) {
+      const verdict = await this.ask(email);
+      if (verdict !== "busy") return verdict;
+      await this.sleep(wait);
+    }
+    const verdict = await this.ask(email);
+    if (verdict === "busy") throw new RemoteProbeError("probe host HTTP 429: busy");
+    return verdict;
+  }
+
+  private async ask(email: string): Promise<Verdict | "busy"> {
     let resp: Response;
     try {
       resp = await this.fetchImpl(`${this.base}/verify`, {
@@ -39,6 +65,10 @@ export class RemoteProbe implements MailboxProbe {
       throw new RemoteProbeError(
         `probe host unreachable: ${err instanceof Error ? err.name : "Error"}`,
       );
+    }
+    if (resp.status === 429) {
+      await resp.body?.cancel();
+      return "busy";
     }
     if (!resp.ok) {
       // The server's own error text (ours, short, never a secret); anything else is dropped.
