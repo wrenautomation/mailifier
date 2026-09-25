@@ -69,6 +69,12 @@ every verdict: if port 25 is not open from this host it answers **503**, never a
 verifier that quietly reports `risky` for a working mailbox is worse than one that
 stops.
 
+Each MX host gets one conversation at a time with a gap between probes
+(`PROBE_HOST_GAP_MS`, default 1500). Google, Microsoft, Proofpoint and Mimecast front
+thousands of domains under one host name, so a list heavy in them queues behind that one
+host; `PROBE_BIG_HOST_LANES` (default 1) gives those fleets that many conversations at
+once, each with its own gap.
+
 `GET /healthz` → `{ ok, in_flight, port_25 }`.
 
 The published package also carries `dist/mailifier.mjs`: the whole server in one file,

@@ -2,7 +2,15 @@
 
 import { describe, expect, it } from "vitest";
 import type { Resolver } from "./dns.js";
-import { type Conversation, type Dialer, mailHosts, probeMailbox, SmtpProbe } from "./smtp.js";
+import {
+  bigProviderLanes,
+  type Conversation,
+  type Dialer,
+  isBigProvider,
+  mailHosts,
+  probeMailbox,
+  SmtpProbe,
+} from "./smtp.js";
 
 /** A server that answers each command from a table; `banner` first. */
 function script(
@@ -165,5 +173,36 @@ describe("SmtpProbe", () => {
     expect(slept).toEqual([700, 700]);
     expect(a.raw).toMatchObject({ reason: "accepted", mx: "mx1.acme.example", helo: "probe.test" });
     expect((a.raw.transcript as unknown[]).length).toBeGreaterThan(3);
+  });
+
+  it("gives a big shared host several lanes, each with its own gap", async () => {
+    let open = 0;
+    let peak = 0;
+    const v = new SmtpProbe({
+      helo: "probe.test",
+      resolver: async (_name, type) => (type === "MX" ? ["10 aspmx.l.google.com."] : []),
+      random: () => "zz-random",
+      perHostGapMs: 0,
+      lanesFor: bigProviderLanes(3),
+      sleep: async () => {},
+      dial: async () => {
+        open += 1;
+        peak = Math.max(peak, open);
+        await new Promise((r) => setTimeout(r, 10));
+        open -= 1;
+        return google((line) => (line.includes("zz-random") ? "550 5.1.1 nope" : "250 OK"));
+      },
+    });
+    await Promise.all(["a", "b", "c", "d", "e", "f"].map((u) => v.verify(`${u}@acme.example`)));
+    expect(peak).toBe(3);
+  });
+
+  it("knows the big shared fleets by host name", () => {
+    expect(isBigProvider("aspmx.l.google.com.")).toBe(true);
+    expect(isBigProvider("acme-com.mail.protection.outlook.com")).toBe(true);
+    expect(isBigProvider("mx1-us1.ppe-hosted.com")).toBe(true);
+    expect(isBigProvider("us-smtp-inbound-1.mimecast.com")).toBe(true);
+    expect(isBigProvider("mail.notgoogle.com")).toBe(false);
+    expect(bigProviderLanes(4)("mx.acme.example")).toBe(1);
   });
 });

@@ -271,7 +271,30 @@ export const dialTcp: Dialer = (host, port, timeoutMs) =>
 export interface SmtpProbeSettings extends SmtpProbeOptions {
   /** Least time between two probes at the same MX; ours is a guest there. */
   perHostGapMs?: number;
+  /**
+   * Conversations at once with one MX host (default 1). Each lane keeps the gap.
+   * Worth more than 1 only for the big shared inbound fleets (`bigProviderLanes`),
+   * where thousands of domains queue behind one host name.
+   */
+  lanesFor?: (host: string) => number;
   sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Shared inbound fleets that front thousands of domains under one host name and take
+ * mail from the whole internet at once: Google, Microsoft, Proofpoint, Mimecast.
+ */
+const BIG_PROVIDER =
+  /(^|\.)(google\.com|googlemail\.com|outlook\.com|pphosted\.com|ppe-hosted\.com|mimecast\.com)$/;
+
+export function isBigProvider(host: string): boolean {
+  return BIG_PROVIDER.test(host.toLowerCase().replace(/\.$/, ""));
+}
+
+/** `lanesFor` that gives the big shared fleets `lanes` and everyone else one. */
+export function bigProviderLanes(lanes: number): (host: string) => number {
+  const n = Math.max(1, Math.floor(lanes));
+  return (host) => (isBigProvider(host) ? n : 1);
 }
 
 /**
@@ -281,6 +304,7 @@ export interface SmtpProbeSettings extends SmtpProbeOptions {
 export class SmtpProbe implements MailboxProbe {
   readonly name = "smtp";
   private readonly lastByHost = new Map<string, Promise<void>>();
+  private readonly turnsByHost = new Map<string, number>();
   private readonly gapMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
 
@@ -293,7 +317,11 @@ export class SmtpProbe implements MailboxProbe {
     const domain = email.slice(email.lastIndexOf("@") + 1).toLowerCase();
     const resolver = this.opts.resolver ?? ((n, t) => dohResolve(n, t));
     // The queue key is the primary MX: what we are actually about to knock on.
-    const key = (await mailHosts(domain, resolver))[0] ?? domain;
+    const host = (await mailHosts(domain, resolver))[0] ?? domain;
+    // Round-robin over the host's lanes; each lane is its own queue with its own gap.
+    const turns = this.turnsByHost.get(host) ?? 0;
+    this.turnsByHost.set(host, turns + 1);
+    const key = `${host}#${turns % Math.max(1, this.opts.lanesFor?.(host) ?? 1)}`;
     const previous = this.lastByHost.get(key) ?? Promise.resolve();
     const turn = previous.then(async () => {
       const outcome = await probeMailbox(email, { ...this.opts, resolver });

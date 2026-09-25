@@ -3,9 +3,11 @@ import { makeProbeServer } from "./server.js";
 /**
  * Serve the probe on PROBE_PORT (2525). Env: PROBE_TOKEN (required), PROBE_HELO
  * (required), PROBE_HOST_GAP_MS, PROBE_MAX_IN_FLIGHT (calls at once, default 8),
+ * PROBE_BIG_HOST_LANES (conversations at once with Google/Microsoft/Proofpoint/Mimecast
+ * inbound hosts, default 1),
  * PROBE_CANARY_HOST (an MX known to answer; default Google's inbound).
  */
-import { dialTcp, SMTP_PORT, SmtpProbe } from "./smtp.js";
+import { bigProviderLanes, dialTcp, SMTP_PORT, SmtpProbe } from "./smtp.js";
 
 const port = Number(process.env.PROBE_PORT ?? 2525);
 const token = process.env.PROBE_TOKEN ?? "";
@@ -18,6 +20,7 @@ if (!token || !helo) {
 const probe = new SmtpProbe({
   helo,
   perHostGapMs: Number(process.env.PROBE_HOST_GAP_MS ?? 1500),
+  lanesFor: bigProviderLanes(Number(process.env.PROBE_BIG_HOST_LANES ?? 1)),
 });
 // One banner read from a well-known MX, remembered for ten minutes, says whether port
 // 25 is open from here. Open once = trusted for the window; closed = checked again.
