@@ -34,7 +34,7 @@ export interface Exchange {
 /** What the wire said, before it is read as a verdict. */
 export interface ProbeOutcome {
   result: MailboxResult;
-  /** Why, in one word: accepted, rejected, catch_all, greylisted, blocked, unreachable, no_mx, dns_error. */
+  /** Why, in one word: accepted, rejected, catch_all, catch_all_unknown, greylisted, blocked, unreachable, no_mx, dns_error. */
   reason: string;
   mx: string | null;
   /** The RCPT reply for the address itself, when one was given. */
@@ -60,6 +60,17 @@ export interface SmtpProbeOptions {
   dial?: Dialer;
   resolver?: Resolver;
   random?: () => string;
+  /**
+   * What we already know about a domain's catch-all: true = takes any address, false =
+   * rejects unknown ones. Saves the extra conversation `probeMailbox` needs when the
+   * in-session check is refused. Absent = learn afresh each probe.
+   */
+  catchAll?: CatchAllMemory;
+}
+
+export interface CatchAllMemory {
+  get(domain: string): boolean | undefined;
+  set(domain: string, acceptsAll: boolean): void;
 }
 
 class SmtpReply extends Error {
@@ -128,7 +139,9 @@ async function converse(
   if (replyClass(rcpt.code) === 2) {
     const domain = email.slice(email.lastIndexOf("@") + 1);
     const probe = await step(`RCPT TO:<${opts.random()}@${domain}>`);
-    randomAccepted = replyClass(probe.code) === 2;
+    // Only a 2xx or a "no such user" answers the question. Microsoft 365 says "452 Too
+    // many recipients" to any second RCPT from us: that is no answer at all.
+    randomAccepted = replyClass(probe.code) === 2 ? true : isUserReject(probe) ? false : null;
   }
   try {
     await conv.write("QUIT");
@@ -139,6 +152,10 @@ async function converse(
   return { code: rcpt.code, reply: rcpt.reply, randomAccepted };
 }
 
+/** A 5xx that means "no such mailbox", not a policy refusal of us. */
+const isUserReject = ({ code, reply }: { code: number; reply: string }) =>
+  replyClass(code) === 5 && (enhanced(reply)?.[2] === "1" || REJECTED_USER.test(reply));
+
 /** Read the RCPT answer as a verdict. */
 function readRcpt(
   code: number,
@@ -147,6 +164,7 @@ function readRcpt(
 ): Pick<ProbeOutcome, "result" | "reason"> {
   const klass = replyClass(code);
   if (klass === 2) {
+    if (randomAccepted === null) return { result: "risky", reason: "catch_all_unknown" };
     return randomAccepted
       ? { result: "catch_all", reason: "catch_all" }
       : { result: "valid", reason: "accepted" };
@@ -199,8 +217,21 @@ export async function probeMailbox(email: string, opts: SmtpProbeOptions): Promi
       continue;
     }
     try {
-      const { code, reply, randomAccepted } = await converse(session, email, conv, transcript);
-      return { ...readRcpt(code, reply, randomAccepted), mx: host, code, transcript };
+      const said = await converse(session, email, conv, transcript);
+      let randomAccepted = said.randomAccepted;
+      if (isUserReject(said)) opts.catchAll?.set(domain, false);
+      if (replyClass(said.code) === 2 && randomAccepted === null) {
+        randomAccepted =
+          opts.catchAll?.get(domain) ??
+          (await askRandomAlone(host, domain, { dial, timeoutMs, conv, transcript }));
+      }
+      if (randomAccepted !== null) opts.catchAll?.set(domain, randomAccepted);
+      return {
+        ...readRcpt(said.code, said.reply, randomAccepted),
+        mx: host,
+        code: said.code,
+        transcript,
+      };
     } catch (err) {
       session.close();
       if (err instanceof SmtpReply) {
@@ -213,6 +244,39 @@ export async function probeMailbox(email: string, opts: SmtpProbeOptions): Promi
     }
   }
   return { result: "risky", reason: lastReason, mx: null, code: null, transcript };
+}
+
+/**
+ * The catch-all question on its own conversation, the made-up address as the first and
+ * only RCPT: hosts that refuse a second RCPT (Microsoft 365) still answer a first one.
+ * true = takes any address, false = rejects unknown ones, null = still no answer.
+ */
+async function askRandomAlone(
+  host: string,
+  domain: string,
+  o: {
+    dial: Dialer;
+    timeoutMs: number;
+    conv: Required<Pick<SmtpProbeOptions, "helo" | "mailFrom" | "random">>;
+    transcript: Exchange[];
+  },
+): Promise<boolean | null> {
+  let session: Conversation;
+  try {
+    session = await o.dial(host, SMTP_PORT, o.timeoutMs);
+  } catch (err) {
+    o.transcript.push({ sent: null, code: 0, reply: `connect ${host}: ${errorName(err)}` });
+    return null;
+  }
+  try {
+    const said = await converse(session, `${o.conv.random()}@${domain}`, o.conv, o.transcript);
+    if (replyClass(said.code) === 2) return true;
+    return isUserReject(said) ? false : null;
+  } catch (err) {
+    session.close();
+    o.transcript.push({ sent: null, code: 0, reply: `${host}: ${errorName(err)}` });
+    return null;
+  }
 }
 
 /**
@@ -317,6 +381,39 @@ export function bigProviderLanes(lanes: number): (host: string) => number {
 }
 
 /**
+ * A bounded, expiring `CatchAllMemory`: the oldest entry goes when full, an entry
+ * older than `ttlMs` is forgotten (a domain can change its mail setup).
+ */
+export class CatchAllCache implements CatchAllMemory {
+  private readonly entries = new Map<string, { acceptsAll: boolean; at: number }>();
+
+  constructor(
+    private readonly max = 50_000,
+    private readonly ttlMs = 86_400_000,
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  get(domain: string): boolean | undefined {
+    const e = this.entries.get(domain);
+    if (!e) return undefined;
+    if (this.now() - e.at > this.ttlMs) {
+      this.entries.delete(domain);
+      return undefined;
+    }
+    return e.acceptsAll;
+  }
+
+  set(domain: string, acceptsAll: boolean): void {
+    this.entries.delete(domain);
+    this.entries.set(domain, { acceptsAll, at: this.now() });
+    if (this.entries.size > this.max) {
+      const oldest = this.entries.keys().next().value;
+      if (oldest !== undefined) this.entries.delete(oldest);
+    }
+  }
+}
+
+/**
  * The probe over `probeMailbox`, serialising per MX host with a gap between them: one
  * conversation at a time with any given server, because we are a guest there.
  */
@@ -326,8 +423,10 @@ export class SmtpProbe implements MailboxProbe {
   private readonly turnsByHost = new Map<string, number>();
   private readonly gapMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly catchAll: CatchAllMemory;
 
   constructor(private readonly opts: SmtpProbeSettings) {
+    this.catchAll = opts.catchAll ?? new CatchAllCache();
     this.gapMs = opts.perHostGapMs ?? 1_500;
     this.sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   }
@@ -350,7 +449,11 @@ export class SmtpProbe implements MailboxProbe {
     const key = `${host}#${turns % Math.max(1, this.opts.lanesFor?.(host) ?? 1)}`;
     const previous = this.lastByHost.get(key) ?? Promise.resolve();
     const turn = previous.then(async () => {
-      const outcome = await probeMailbox(email, { ...this.opts, resolver });
+      const outcome = await probeMailbox(email, {
+        ...this.opts,
+        resolver,
+        catchAll: this.catchAll,
+      });
       await this.sleep(this.gapMs);
       return outcome;
     });

@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { DohError, DohStatusError, type Resolver } from "./dns.js";
 import {
   bigProviderLanes,
+  CatchAllCache,
   type Conversation,
   type Dialer,
   isBigProvider,
@@ -54,6 +55,80 @@ const resolver: Resolver = async (name, type) => {
   return [];
 };
 const opts = (dial: Dialer) => ({ helo: "probe.test", dial, resolver, random: () => "zz-random" });
+
+/** Microsoft 365 as we meet it: answers the first RCPT, says 452 to any second one. */
+const microsoft = (first: (line: string) => string) => {
+  let rcpts = 0;
+  return script("220 outlook ESMTP", {
+    EHLO: "250 outlook.example",
+    MAIL: "250 2.1.0 Sender OK",
+    RCPT: (line) => {
+      rcpts += 1;
+      return rcpts === 1 ? first(line) : "452 4.5.3 Too many recipients";
+    },
+    QUIT: "221 bye",
+  });
+};
+const tenant = (acceptsAll: boolean | "silent") => (line: string) =>
+  !line.includes("zz-random")
+    ? "250 2.1.5 Recipient OK"
+    : acceptsAll === "silent"
+      ? "451 4.7.500 Try again later"
+      : acceptsAll
+        ? "250 2.1.5 Recipient OK"
+        : "550 5.4.1 Recipient address rejected: Access denied";
+
+describe("the catch-all check when a host refuses a second RCPT", () => {
+  const run = async (acceptsAll: boolean | "silent", catchAll?: CatchAllCache) => {
+    let dials = 0;
+    const out = await probeMailbox("jane@acme.example", {
+      ...opts(async () => {
+        dials += 1;
+        return microsoft(tenant(acceptsAll));
+      }),
+      ...(catchAll ? { catchAll } : {}),
+    });
+    return { out, dials };
+  };
+
+  it("asks again on a fresh conversation: rejected there = valid", async () => {
+    const { out, dials } = await run(false);
+    expect(out).toMatchObject({ result: "valid", reason: "accepted", mx: "mx1.acme.example" });
+    expect(dials).toBe(2);
+  });
+
+  it("accepted there = catch_all", async () => {
+    expect((await run(true)).out).toMatchObject({ result: "catch_all", reason: "catch_all" });
+  });
+
+  it("no answer there either = risky, never valid", async () => {
+    expect((await run("silent")).out).toMatchObject({
+      result: "risky",
+      reason: "catch_all_unknown",
+    });
+  });
+
+  it("remembers the domain's answer: one extra conversation per domain", async () => {
+    const memory = new CatchAllCache();
+    expect((await run(false, memory)).dials).toBe(2);
+    const again = await run(false, memory);
+    expect(again).toMatchObject({ dials: 1, out: { result: "valid" } });
+  });
+});
+
+describe("CatchAllCache", () => {
+  it("forgets after its ttl and drops the oldest when full", () => {
+    let now = 0;
+    const cache = new CatchAllCache(2, 1_000, () => now);
+    cache.set("a.example", true);
+    cache.set("b.example", false);
+    cache.set("c.example", true);
+    expect(cache.get("a.example")).toBeUndefined();
+    expect(cache.get("b.example")).toBe(false);
+    now = 1_001;
+    expect(cache.get("c.example")).toBeUndefined();
+  });
+});
 
 describe("mailHosts", () => {
   it("orders MX by priority and strips the dot", async () =>
