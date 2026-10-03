@@ -7,6 +7,7 @@ import {
   CatchAllCache,
   type Conversation,
   type Dialer,
+  fleetOf,
   isBigProvider,
   mailHosts,
   probeMailbox,
@@ -386,6 +387,38 @@ describe("SmtpProbe", () => {
     expect(slept).toEqual([700, 700]);
     expect(a.raw).toMatchObject({ reason: "accepted", mx: "mx1.acme.example", helo: "probe.test" });
     expect((a.raw.transcript as unknown[]).length).toBeGreaterThan(3);
+  });
+
+  it("leaves a fleet alone for a day once it says our IP is on a reputation list", async () => {
+    let clock = 0;
+    let dials = 0;
+    const fleet: Resolver = async (name, type) =>
+      type === "MX" ? [`10 mx${name.length}.pphosted.example.`] : [];
+    const probe = new SmtpProbe({
+      helo: "probe.test",
+      resolver: fleet,
+      random: () => "zz-random",
+      sleep: async () => {},
+      now: () => clock,
+      dial: async () => {
+        dials++;
+        return google(() => "554 Blocked - see https://ipcheck.proofpoint.com/?ip=192.0.2.1");
+      },
+    });
+    const first = await probe.verify("jane@acme.example");
+    expect(first).toMatchObject({ result: "risky", raw: { reason: "blocked" } });
+    const held = await probe.verify("bob@other-firm.example");
+    expect(held).toMatchObject({ result: "risky", raw: { reason: "blocked", mx: null } });
+    expect(dials).toBe(1);
+    clock = 86_400_001;
+    await probe.verify("bob@other-firm.example");
+    expect(dials).toBe(2);
+  });
+
+  it("names the fleet an MX belongs to", () => {
+    expect(fleetOf("mx0a-001.pphosted.com.")).toBe("pphosted.com");
+    expect(fleetOf("mx.firm.co.uk")).toBe("firm.co.uk");
+    expect(fleetOf("mail.firm.ca")).toBe("firm.ca");
   });
 
   it("gives a big shared host several lanes, each with its own gap", async () => {

@@ -485,6 +485,34 @@ export interface SmtpProbeSettings extends SmtpProbeOptions {
    */
   lanesFor?: (host: string) => number;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * How long a mail fleet that refused us by IP reputation is left alone (default one
+   * day). Proofpoint and Validity list an IP for what it does and drop it once that
+   * stops; every probe while listed just renews the listing.
+   */
+  listedHoldMs?: number;
+  now?: () => number;
+}
+
+/**
+ * A refusal that names a reputation list our IP is on: Proofpoint, Validity
+ * (Sender Score), Spamhaus, Barracuda and the like, or a generic "blocked using".
+ */
+const LISTED =
+  /blocked using|blocked by|blocklist|blacklist|ipcheck\.proofpoint|senderscore|spamhaus|barracuda|spamcop|sorbs/i;
+
+/**
+ * The mail fleet an MX belongs to: its registrable domain ("mx1.pphosted.com" ->
+ * "pphosted.com"), three labels under a two-letter country code with a short second
+ * level ("mx.firm.co.uk" -> "firm.co.uk"). One listing covers every host of a fleet.
+ */
+export function fleetOf(host: string): string {
+  const labels = host.toLowerCase().replace(/\.$/, "").split(".");
+  const ccSecondLevel =
+    labels.length >= 3 &&
+    (labels.at(-1) as string).length === 2 &&
+    (labels.at(-2) as string).length <= 3;
+  return labels.slice(ccSecondLevel ? -3 : -2).join(".");
 }
 
 /**
@@ -548,8 +576,14 @@ export class SmtpProbe implements MailboxProbe {
   private readonly gapMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly catchAll: CatchAllMemory;
+  /** Fleet -> when its reputation hold lifts. Bounded by the fleets we ever meet. */
+  private readonly listedUntil = new Map<string, number>();
+  private readonly listedHoldMs: number;
+  private readonly now: () => number;
 
   constructor(private readonly opts: SmtpProbeSettings) {
+    this.listedHoldMs = opts.listedHoldMs ?? 86_400_000;
+    this.now = opts.now ?? Date.now;
     this.catchAll = opts.catchAll ?? new CatchAllCache();
     this.gapMs = opts.perHostGapMs ?? 1_500;
     this.sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
@@ -567,17 +601,25 @@ export class SmtpProbe implements MailboxProbe {
       throw err;
     }
     const host = hosts[0] ?? domain;
+    const fleet = fleetOf(host);
+    const heldNow = this.held(fleet);
+    if (heldNow) return this.verdictOf(heldNow);
     // Round-robin over the host's lanes; each lane is its own queue with its own gap.
     const turns = this.turnsByHost.get(host) ?? 0;
     this.turnsByHost.set(host, turns + 1);
     const key = `${host}#${turns % Math.max(1, this.opts.lanesFor?.(host) ?? 1)}`;
     const previous = this.lastByHost.get(key) ?? Promise.resolve();
     const turn = previous.then(async () => {
+      // Probes queued behind the one that met the listing need no connection either.
+      const heldThen = this.held(fleet);
+      if (heldThen) return heldThen;
       const outcome = await probeMailbox(email, {
         ...this.opts,
         resolver,
         catchAll: this.catchAll,
       });
+      if (outcome.reason === "blocked" && outcome.transcript.some((x) => LISTED.test(x.reply)))
+        this.listedUntil.set(fleet, this.now() + this.listedHoldMs);
       await this.sleep(this.gapMs);
       return outcome;
     });
@@ -589,6 +631,20 @@ export class SmtpProbe implements MailboxProbe {
       ),
     );
     return this.verdictOf(await turn);
+  }
+
+  /** Listed at this fleet: asking renews the listing. The same verdict, no connection. */
+  private held(fleet: string): ProbeOutcome | null {
+    const until = this.listedUntil.get(fleet) ?? 0;
+    if (until <= this.now()) return null;
+    const reply = `held: ${fleet} lists our IP until ${new Date(until).toISOString()}`;
+    return {
+      result: "risky",
+      reason: "blocked",
+      mx: null,
+      code: null,
+      transcript: [{ sent: null, code: 0, reply }],
+    };
   }
 
   private verdictOf(outcome: ProbeOutcome): Verdict {
