@@ -182,6 +182,22 @@ describe("probeMailbox", () => {
     ["450 4.2.0 Greylisted, try again later", "risky", "greylisted"],
     ["550-5.2.1 The email account that you tried to reach is inactive.", "invalid", "disabled"],
     ["552 5.2.2 Mailbox full", "risky", "blocked"],
+    [
+      "450 4.7.1 Client host rejected: cannot find your reverse hostname, [192.0.2.1]",
+      "risky",
+      "no_ptr",
+    ],
+    ["550 5.7.1 Client host rejected: cannot find your hostname, [192.0.2.1]", "risky", "no_ptr"],
+    [
+      "454 4.7.0 Connection is not TLS encrypted. Recipient organization requires TLS.",
+      "risky",
+      "tls_required",
+    ],
+    [
+      "451 4.4.4 Mail received as unauthenticated, incoming to a recipient domain configured in a hosted tenant which has no mail-enabled subscriptions.",
+      "risky",
+      "blocked",
+    ],
   ])("%s -> %s", async (reply, result, reason) => {
     const out = await probeMailbox(
       "jane@acme.example",
@@ -214,6 +230,16 @@ describe("probeMailbox", () => {
       "connect mx1.acme.example: Error ETIMEDOUT",
       "connect mx2.acme.example: Error ETIMEDOUT",
     ]);
+  });
+
+  it("a greeting refused for missing reverse DNS is no_ptr, not a greylist", async () => {
+    const out = await probeMailbox(
+      "jane@acme.example",
+      opts(async () =>
+        script("421 mx.example CMGW Temporarily rejected. Reverse DNS for 192.0.2.1 failed.", {}),
+      ),
+    );
+    expect(out).toMatchObject({ result: "risky", reason: "no_ptr", mx: null });
   });
 
   it("MX names that do not resolve are the domain's broken DNS, one that resolves is reach", async () => {

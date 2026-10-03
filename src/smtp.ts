@@ -34,7 +34,7 @@ export interface Exchange {
 /** What the wire said, before it is read as a verdict. */
 export interface ProbeOutcome {
   result: MailboxResult;
-  /** Why, in one word: accepted, rejected, disabled, catch_all, catch_all_unknown, greylisted, blocked, unreachable, no_mx, dns_error. */
+  /** Why, in one word: accepted, rejected, disabled, catch_all, catch_all_unknown, greylisted, blocked, no_ptr, tls_required, unreachable, no_mx, dns_error. */
   reason: string;
   mx: string | null;
   /** The RCPT reply for the address itself, when one was given. */
@@ -92,6 +92,21 @@ const replyCode = (reply: string) => Number.parseInt(reply.slice(0, 3), 10);
 const REJECTED_USER =
   /user unknown|no such user|does not exist|unknown user|recipient rejected|recipient address rejected|invalid recipient|no mailbox|mailbox not found|mailbox unavailable|address rejected/i;
 const replyClass = (code: number) => Math.floor(code / 100);
+/** A refusal because our IP has no reverse DNS (PTR). It lasts until the PTR exists. */
+const NO_PTR =
+  /reverse (dns|hostname|lookup)|cannot find your (reverse )?hostname|\bptr\b|\brdns\b/i;
+/** The recipient requires TLS, which a probe does not speak. */
+const TLS_REQUIRED = /requires? tls|must issue a starttls|not tls encrypted/i;
+/** A 4xx that will say the same in an hour: Microsoft's "tenant has no mail". */
+const STANDING_REFUSAL = /4\.4\.4 mail received as unauthenticated/i;
+
+/** Why a server refused, when the refusal is about us or the box, not the address. */
+function refusalReason(code: number, reply: string): string {
+  if (NO_PTR.test(reply)) return "no_ptr";
+  if (TLS_REQUIRED.test(reply)) return "tls_required";
+  if (replyClass(code) === 4 && !STANDING_REFUSAL.test(reply)) return "greylisted";
+  return "blocked";
+}
 /** RFC 3463 enhanced code carried in the text, e.g. "5.1.1". */
 const enhanced = (reply: string) => /\b([245])\.(\d{1,3})\.(\d{1,3})\b/.exec(reply);
 
@@ -177,9 +192,8 @@ function readRcpt(
       return { result: "invalid", reason: "rejected" };
     // 5.2.1 = mailbox disabled (Google: "account ... is inactive"): it takes no mail.
     if (enh?.[2] === "2" && enh[3] === "1") return { result: "invalid", reason: "disabled" };
-    return { result: "risky", reason: "blocked" };
   }
-  return { result: "risky", reason: "greylisted" };
+  return { result: "risky", reason: refusalReason(code, reply) };
 }
 
 /**
@@ -242,7 +256,7 @@ export async function probeMailbox(email: string, opts: SmtpProbeOptions): Promi
       session.close();
       if (err instanceof SmtpReply) {
         // A greeting or envelope refusal: about us, not the address. Try the next MX.
-        lastReason = replyClass(err.code) === 4 ? "greylisted" : "blocked";
+        lastReason = refusalReason(err.code, err.text);
         continue;
       }
       transcript.push({ sent: null, code: 0, reply: `${host}: ${errorName(err)}` });
