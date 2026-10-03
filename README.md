@@ -3,8 +3,8 @@
 Ask a mail server whether an address exists. No mail is ever sent.
 
 This is the handshake the paid verification services run, from a host of yours:
-MX lookup → connect on port 25 → `EHLO` → `MAIL FROM` → `RCPT TO <the address>` →
-`QUIT`. The server's answer to `RCPT` is the verdict. There is no `DATA`, so nothing
+MX lookup → connect on port 25 → `EHLO` → `STARTTLS` when offered → `MAIL FROM` →
+`RCPT TO <the address>` → `QUIT`. The server's answer to `RCPT` is the verdict. There is no `DATA`, so nothing
 is ever delivered.
 
 Zero runtime dependencies. Node 22+.

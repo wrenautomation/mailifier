@@ -1,7 +1,8 @@
 /**
  * The SMTP handshake a paid verification service runs, from a host of yours.
  *
- * MX lookup → connect on 25 → EHLO → MAIL FROM → RCPT TO <the address> → QUIT. The
+ * MX lookup → connect on 25 → EHLO → STARTTLS when offered → MAIL FROM → RCPT TO
+ * <the address> → QUIT. The
  * server's answer to RCPT is the verdict: 250 accepted, 5xx no such user, 4xx "ask
  * later" (greylisting). A second RCPT to a random local part tells catch-all domains
  * apart from real acceptance. No DATA, so nothing is ever delivered.
@@ -16,6 +17,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
+import { connect as tlsConnect } from "node:tls";
 import { DohStatusError, resolve as dohResolve, type Resolver } from "./dns.js";
 import type { MailboxProbe, MailboxResult, Verdict } from "./verdict.js";
 
@@ -48,6 +50,11 @@ export interface Conversation {
   read(): Promise<string>;
   write(line: string): Promise<void>;
   close(): void;
+  /**
+   * Switch this connection to TLS after the server's 220 to STARTTLS. Absent = this
+   * conversation cannot, and the probe stays plain. Fails with `TlsFailed`.
+   */
+  startTls?(servername: string): Promise<void>;
 }
 export type Dialer = (host: string, port: number, timeoutMs: number) => Promise<Conversation>;
 
@@ -60,6 +67,12 @@ export interface SmtpProbeOptions {
   dial?: Dialer;
   resolver?: Resolver;
   random?: () => string;
+  /**
+   * Upgrade to TLS when the server offers STARTTLS, as mail servers do with each other
+   * (default true). Some servers refuse plain probes; a handshake that fails is retried
+   * plain on a fresh connection.
+   */
+  startTls?: boolean;
   /**
    * What we already know about a domain's catch-all: true = takes any address, false =
    * rejects unknown ones. Saves the extra conversation `probeMailbox` needs when the
@@ -82,6 +95,20 @@ class SmtpReply extends Error {
     this.name = "SmtpReply";
   }
 }
+
+/** The TLS handshake after STARTTLS failed: the server's TLS, not the address. */
+export class TlsFailed extends Error {
+  constructor(cause: unknown) {
+    super(`tls handshake: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = "TlsFailed";
+  }
+}
+
+type ConverseOpts = Required<Pick<SmtpProbeOptions, "helo" | "mailFrom" | "random">> & {
+  startTls: boolean;
+};
+
+const offersStartTls = (ehlo: string) => /^250[ -]STARTTLS\b/im.test(ehlo);
 
 const replyCode = (reply: string) => Number.parseInt(reply.slice(0, 3), 10);
 /**
@@ -131,7 +158,8 @@ export async function mailHosts(domain: string, resolver: Resolver): Promise<str
 async function converse(
   conv: Conversation,
   email: string,
-  opts: Required<Pick<SmtpProbeOptions, "helo" | "mailFrom" | "random">>,
+  host: string,
+  opts: ConverseOpts,
   transcript: Exchange[],
 ): Promise<{ code: number; reply: string; randomAccepted: boolean | null }> {
   const step = async (line: string | null): Promise<{ code: number; reply: string }> => {
@@ -147,7 +175,20 @@ async function converse(
     return r;
   };
   await expect(null, 220);
-  await expect(`EHLO ${opts.helo}`, 250);
+  const ehlo = await expect(`EHLO ${opts.helo}`, 250);
+  if (opts.startTls && conv.startTls && offersStartTls(ehlo.reply)) {
+    // A refused STARTTLS leaves the session plain and usable: carry on without it.
+    if ((await step("STARTTLS")).code === 220) {
+      try {
+        await conv.startTls(host);
+      } catch (err) {
+        throw err instanceof TlsFailed ? err : new TlsFailed(err);
+      }
+      transcript.push({ sent: null, code: 0, reply: "tls" });
+      // TLS resets the session: the server forgets the first EHLO.
+      await expect(`EHLO ${opts.helo}`, 250);
+    }
+  }
   await expect(`MAIL FROM:<${opts.mailFrom}>`, 250);
   const rcpt = await step(`RCPT TO:<${email}>`);
   let randomAccepted: boolean | null = null;
@@ -205,10 +246,11 @@ export async function probeMailbox(email: string, opts: SmtpProbeOptions): Promi
   const resolver = opts.resolver ?? ((n, t) => dohResolve(n, t));
   const dial = opts.dial ?? dialTcp;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const conv = {
+  const conv: ConverseOpts = {
     helo: opts.helo,
     mailFrom: opts.mailFrom ?? `postmaster@${opts.helo}`,
     random: opts.random ?? (() => `wren-${randomBytes(6).toString("hex")}`),
+    startTls: opts.startTls ?? true,
   };
   const domain = email.slice(email.lastIndexOf("@") + 1).toLowerCase();
   const transcript: Exchange[] = [];
@@ -226,7 +268,8 @@ export async function probeMailbox(email: string, opts: SmtpProbeOptions): Promi
   const tried = hosts.slice(0, MAX_MX_TRIED);
   // MX names that do not resolve: the domain's DNS is broken, not our reach.
   let unresolved = 0;
-  for (const host of tried) {
+  for (let i = 0; i < tried.length; i++) {
+    const host = tried[i] as string;
     let session: Conversation;
     try {
       session = await dial(host, SMTP_PORT, timeoutMs);
@@ -237,7 +280,7 @@ export async function probeMailbox(email: string, opts: SmtpProbeOptions): Promi
       continue;
     }
     try {
-      const said = await converse(session, email, conv, transcript);
+      const said = await converse(session, email, host, conv, transcript);
       let randomAccepted = said.randomAccepted;
       if (isUserReject(said)) opts.catchAll?.set(domain, false);
       if (replyClass(said.code) === 2 && randomAccepted === null) {
@@ -259,6 +302,13 @@ export async function probeMailbox(email: string, opts: SmtpProbeOptions): Promi
         lastReason = refusalReason(err.code, err.text);
         continue;
       }
+      if (err instanceof TlsFailed && conv.startTls) {
+        // Their TLS is broken: ask the same host again in plain text, as a mail server would.
+        transcript.push({ sent: null, code: 0, reply: `${host}: ${err.message.slice(0, 150)}` });
+        conv.startTls = false;
+        i--;
+        continue;
+      }
       transcript.push({ sent: null, code: 0, reply: `${host}: ${errorName(err)}` });
       lastReason = "unreachable";
     }
@@ -277,7 +327,7 @@ async function askRandomAlone(
   o: {
     dial: Dialer;
     timeoutMs: number;
-    conv: Required<Pick<SmtpProbeOptions, "helo" | "mailFrom" | "random">>;
+    conv: ConverseOpts;
     transcript: Exchange[];
   },
 ): Promise<boolean | null> {
@@ -289,7 +339,13 @@ async function askRandomAlone(
     return null;
   }
   try {
-    const said = await converse(session, `${o.conv.random()}@${domain}`, o.conv, o.transcript);
+    const said = await converse(
+      session,
+      `${o.conv.random()}@${domain}`,
+      host,
+      o.conv,
+      o.transcript,
+    );
     if (replyClass(said.code) === 2) return true;
     return isUserReject(said) ? false : null;
   } catch (err) {
@@ -320,24 +376,26 @@ const errorName = (err: unknown) =>
     ? `${err.name}${(err as NodeJS.ErrnoException).code ? ` ${(err as NodeJS.ErrnoException).code}` : ""}`
     : String(err);
 
-/** The real thing: a TCP socket read line by line, multi-line replies joined. */
+/**
+ * The real thing: a TCP socket read line by line, multi-line replies joined. STARTTLS
+ * wraps the same socket; the peer's certificate is not checked, as between mail servers
+ * (a probe sends nothing worth hiding, it only must not be refused for being plain).
+ */
 export const dialTcp: Dialer = (host, port, timeoutMs) =>
   new Promise((resolveConn, reject) => {
-    const socket: Socket = createConnection({ host, port });
+    let socket: Socket = createConnection({ host, port });
     let buffer = "";
+    let connected = false;
     let waiting: { resolve: (s: string) => void; reject: (e: Error) => void } | null = null;
     const fail = (err: Error) => {
       if (waiting) {
         waiting.reject(err);
         waiting = null;
-      } else reject(err);
+      } else if (!connected) reject(err);
       socket.destroy();
     };
-    socket.setTimeout(timeoutMs, () =>
-      fail(Object.assign(new Error("smtp timeout"), { code: "ETIMEDOUT" })),
-    );
-    socket.on("error", fail);
-    socket.on("close", () => fail(Object.assign(new Error("closed"), { code: "ECONNRESET" })));
+    const onTimeout = () => fail(Object.assign(new Error("smtp timeout"), { code: "ETIMEDOUT" }));
+    const onClose = () => fail(Object.assign(new Error("closed"), { code: "ECONNRESET" }));
     const pump = () => {
       // A reply is complete when its last line has a space after the code ("250 ok"),
       // continuation lines use a dash ("250-SIZE").
@@ -350,11 +408,25 @@ export const dialTcp: Dialer = (host, port, timeoutMs) =>
       waiting = null;
       w.resolve(reply);
     };
-    socket.on("data", (chunk) => {
+    const onData = (chunk: Buffer) => {
       buffer += chunk.toString("latin1");
       pump();
-    });
-    socket.once("connect", () =>
+    };
+    const wire = (s: Socket) => {
+      s.setTimeout(timeoutMs, onTimeout);
+      s.on("error", fail);
+      s.on("close", onClose);
+      s.on("data", onData);
+    };
+    const unwire = (s: Socket) => {
+      s.setTimeout(0);
+      s.off("error", fail);
+      s.off("close", onClose);
+      s.off("data", onData);
+    };
+    wire(socket);
+    socket.once("connect", () => {
+      connected = true;
       resolveConn({
         read: () =>
           new Promise<string>((res, rej) => {
@@ -370,8 +442,37 @@ export const dialTcp: Dialer = (host, port, timeoutMs) =>
           socket.end();
           socket.destroy();
         },
-      }),
-    );
+        startTls: (servername) =>
+          new Promise<void>((res, rej) => {
+            const plain = socket;
+            unwire(plain);
+            buffer = "";
+            const secure = tlsConnect({
+              socket: plain,
+              // SNI takes host names only; an MX may be an address.
+              servername: /^[\d.]+$|:/.test(servername) ? undefined : servername,
+              rejectUnauthorized: false,
+            });
+            const timer = setTimeout(() => {
+              secure.destroy();
+              rej(new TlsFailed(new Error("timeout")));
+            }, timeoutMs);
+            secure.once("secureConnect", () => {
+              clearTimeout(timer);
+              secure.off("error", onHandshakeError);
+              socket = secure;
+              wire(secure);
+              res();
+            });
+            const onHandshakeError = (err: Error) => {
+              clearTimeout(timer);
+              secure.destroy();
+              rej(new TlsFailed(err));
+            };
+            secure.once("error", onHandshakeError);
+          }),
+      });
+    });
   });
 
 export interface SmtpProbeSettings extends SmtpProbeOptions {

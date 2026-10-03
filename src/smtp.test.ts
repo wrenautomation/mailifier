@@ -166,6 +166,96 @@ describe("probeMailbox", () => {
     ]);
   });
 
+  it("upgrades to TLS when offered and greets again inside it", async () => {
+    const upgraded: string[] = [];
+    const conv = {
+      ...script("220 mx.example ESMTP", {
+        EHLO: "250-mx.example\n250-STARTTLS\n250 SIZE 1000",
+        STARTTLS: "220 2.0.0 Ready to start TLS",
+        MAIL: "250 2.1.0 OK",
+        RCPT: (line) => (line.includes("zz-random") ? "550 5.1.1 no such user" : "250 OK"),
+        QUIT: "221 bye",
+      }),
+      async startTls(servername: string) {
+        upgraded.push(servername);
+      },
+    };
+    const out = await probeMailbox(
+      "jane@acme.example",
+      opts(async () => conv),
+    );
+    expect(out).toMatchObject({ result: "valid", mx: "mx1.acme.example" });
+    expect(upgraded).toEqual(["mx1.acme.example"]);
+    expect(conv.lines.slice(0, 4)).toEqual([
+      "EHLO probe.test",
+      "STARTTLS",
+      "EHLO probe.test",
+      "MAIL FROM:<postmaster@probe.test>",
+    ]);
+  });
+
+  it("asks the same host again in plain text when its TLS handshake fails", async () => {
+    const dialed: string[] = [];
+    const out = await probeMailbox(
+      "jane@acme.example",
+      opts(async (host) => {
+        dialed.push(host);
+        return {
+          ...script("220 mx.example ESMTP", {
+            EHLO: "250-mx.example\n250 STARTTLS",
+            STARTTLS: "220 go ahead",
+            MAIL: "250 OK",
+            RCPT: (line) => (line.includes("zz-random") ? "550 5.1.1 no such user" : "250 OK"),
+            QUIT: "221 bye",
+          }),
+          async startTls() {
+            throw new Error("wrong version number");
+          },
+        };
+      }),
+    );
+    expect(dialed).toEqual(["mx1.acme.example", "mx1.acme.example"]);
+    expect(out).toMatchObject({ result: "valid", mx: "mx1.acme.example" });
+    expect(out.transcript.some((x) => x.reply.includes("tls handshake"))).toBe(true);
+  });
+
+  it("stays plain when TLS is not offered, refused, or turned off", async () => {
+    const withTls = (starttls: string) => {
+      const conv = {
+        ...script("220 mx.example ESMTP", {
+          EHLO: "250-mx.example\n250 STARTTLS",
+          STARTTLS: starttls,
+          MAIL: "250 OK",
+          RCPT: (line) => (line.includes("zz-random") ? "550 5.1.1 no such user" : "250 OK"),
+          QUIT: "221 bye",
+        }),
+        async startTls() {
+          throw new Error("must not upgrade");
+        },
+      };
+      return conv;
+    };
+    const refused = withTls("454 4.7.0 TLS not available");
+    expect(
+      await probeMailbox(
+        "jane@acme.example",
+        opts(async () => refused),
+      ),
+    ).toMatchObject({
+      result: "valid",
+    });
+    expect(refused.lines.slice(0, 3)).toEqual([
+      "EHLO probe.test",
+      "STARTTLS",
+      "MAIL FROM:<postmaster@probe.test>",
+    ]);
+    const off = withTls("220 go");
+    expect(
+      await probeMailbox("jane@acme.example", { ...opts(async () => off), startTls: false }),
+    ).toMatchObject({ result: "valid" });
+    expect(off.lines).not.toContain("STARTTLS");
+  });
+
   it("everything accepted = catch_all", async () => {
     const out = await probeMailbox(
       "jane@acme.example",
