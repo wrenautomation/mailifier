@@ -180,6 +180,8 @@ describe("probeMailbox", () => {
     ["550 5.5.0 Requested action not taken: mailbox unavailable", "invalid", "rejected"],
     ["550 5.7.1 Service unavailable, client blocked", "risky", "blocked"],
     ["450 4.2.0 Greylisted, try again later", "risky", "greylisted"],
+    ["550-5.2.1 The email account that you tried to reach is inactive.", "invalid", "disabled"],
+    ["552 5.2.2 Mailbox full", "risky", "blocked"],
   ])("%s -> %s", async (reply, result, reason) => {
     const out = await probeMailbox(
       "jane@acme.example",
@@ -212,6 +214,26 @@ describe("probeMailbox", () => {
       "connect mx1.acme.example: Error ETIMEDOUT",
       "connect mx2.acme.example: Error ETIMEDOUT",
     ]);
+  });
+
+  it("MX names that do not resolve are the domain's broken DNS, one that resolves is reach", async () => {
+    const unresolved = Object.assign(new Error("getaddrinfo"), { code: "ENOTFOUND" });
+    const allUnresolved = await probeMailbox(
+      "jane@acme.example",
+      opts(async () => {
+        throw unresolved;
+      }),
+    );
+    expect(allUnresolved).toMatchObject({ result: "risky", reason: "dns_error", mx: null });
+    const mixed = await probeMailbox(
+      "jane@acme.example",
+      opts(async (host) => {
+        throw host === "mx1.acme.example"
+          ? unresolved
+          : Object.assign(new Error("timeout"), { code: "ETIMEDOUT" });
+      }),
+    );
+    expect(mixed).toMatchObject({ result: "risky", reason: "unreachable" });
   });
 
   it("a domain with no mail routing is invalid without a connection", async () => {

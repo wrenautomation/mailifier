@@ -34,7 +34,7 @@ export interface Exchange {
 /** What the wire said, before it is read as a verdict. */
 export interface ProbeOutcome {
   result: MailboxResult;
-  /** Why, in one word: accepted, rejected, catch_all, catch_all_unknown, greylisted, blocked, unreachable, no_mx, dns_error. */
+  /** Why, in one word: accepted, rejected, disabled, catch_all, catch_all_unknown, greylisted, blocked, unreachable, no_mx, dns_error. */
   reason: string;
   mx: string | null;
   /** The RCPT reply for the address itself, when one was given. */
@@ -175,6 +175,8 @@ function readRcpt(
     // policy, 554 blocked, 552 quota) say something about us or the box, not the address.
     if (enh?.[2] === "1" || REJECTED_USER.test(reply))
       return { result: "invalid", reason: "rejected" };
+    // 5.2.1 = mailbox disabled (Google: "account ... is inactive"): it takes no mail.
+    if (enh?.[2] === "2" && enh[3] === "1") return { result: "invalid", reason: "disabled" };
     return { result: "risky", reason: "blocked" };
   }
   return { result: "risky", reason: "greylisted" };
@@ -207,13 +209,17 @@ export async function probeMailbox(email: string, opts: SmtpProbeOptions): Promi
     return { result: "invalid", reason: "no_mx", mx: null, code: null, transcript };
 
   let lastReason = "unreachable";
-  for (const host of hosts.slice(0, MAX_MX_TRIED)) {
+  const tried = hosts.slice(0, MAX_MX_TRIED);
+  // MX names that do not resolve: the domain's DNS is broken, not our reach.
+  let unresolved = 0;
+  for (const host of tried) {
     let session: Conversation;
     try {
       session = await dial(host, SMTP_PORT, timeoutMs);
     } catch (err) {
       transcript.push({ sent: null, code: 0, reply: `connect ${host}: ${errorName(err)}` });
-      lastReason = "unreachable";
+      if (isUnresolved(err)) unresolved++;
+      lastReason = unresolved === tried.length ? "dns_error" : "unreachable";
       continue;
     }
     try {
@@ -291,6 +297,9 @@ const dnsError = (err: DohStatusError, transcript: Exchange[]): ProbeOutcome => 
   code: null,
   transcript: [...transcript, { sent: null, code: 0, reply: err.message }],
 });
+
+const isUnresolved = (err: unknown) =>
+  ["ENOTFOUND", "ENODATA"].includes((err as NodeJS.ErrnoException | null)?.code ?? "");
 
 const errorName = (err: unknown) =>
   err instanceof Error
