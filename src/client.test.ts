@@ -1,6 +1,6 @@
 /** The remote probe over a fake fetch: no network, no probe host. */
 import { describe, expect, it } from "vitest";
-import { RemoteProbe, RemoteProbeError } from "./client.js";
+import { RemoteProbe, RemoteProbeError, RemoteProbeTimeout } from "./client.js";
 import type { FetchLike } from "./dns.js";
 
 function client(payload: unknown, status = 200, seen?: { url: string; init?: RequestInit }[]) {
@@ -49,6 +49,17 @@ describe("RemoteProbe", () => {
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(RemoteProbeError);
     expect(String(err)).not.toContain("tok-123");
+  });
+
+  it("a verdict that never came is a timeout, not a dead host", async () => {
+    const slow: FetchLike = async () => {
+      throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    };
+    const err = await new RemoteProbe("http://box", "tok-123", slow)
+      .verify("jane@foo.com")
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RemoteProbeTimeout);
+    expect(err).toBeInstanceOf(RemoteProbeError);
   });
 
   it("waits out a busy server and returns the verdict once a slot frees", async () => {

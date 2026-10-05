@@ -491,6 +491,12 @@ export interface SmtpProbeSettings extends SmtpProbeOptions {
    * stops; every probe while listed just renews the listing.
    */
   listedHoldMs?: number;
+  /**
+   * How long an MX host that took no connection on any of its MX names is left alone
+   * (default one hour). Each probe there waits out every socket timeout, and the probes
+   * queued behind it on the same host would each wait them out again.
+   */
+  silentHoldMs?: number;
   now?: () => number;
 }
 
@@ -579,10 +585,14 @@ export class SmtpProbe implements MailboxProbe {
   /** Fleet -> when its reputation hold lifts. Bounded by the fleets we ever meet. */
   private readonly listedUntil = new Map<string, number>();
   private readonly listedHoldMs: number;
+  /** Primary MX -> when its silence hold lifts. Bounded by the hosts that ever went silent. */
+  private readonly silentUntil = new Map<string, number>();
+  private readonly silentHoldMs: number;
   private readonly now: () => number;
 
   constructor(private readonly opts: SmtpProbeSettings) {
     this.listedHoldMs = opts.listedHoldMs ?? 86_400_000;
+    this.silentHoldMs = opts.silentHoldMs ?? 3_600_000;
     this.now = opts.now ?? Date.now;
     this.catchAll = opts.catchAll ?? new CatchAllCache();
     this.gapMs = opts.perHostGapMs ?? 1_500;
@@ -602,7 +612,7 @@ export class SmtpProbe implements MailboxProbe {
     }
     const host = hosts[0] ?? domain;
     const fleet = fleetOf(host);
-    const heldNow = this.held(fleet);
+    const heldNow = this.held(fleet, host);
     if (heldNow) return this.verdictOf(heldNow);
     // Round-robin over the host's lanes; each lane is its own queue with its own gap.
     const turns = this.turnsByHost.get(host) ?? 0;
@@ -610,8 +620,8 @@ export class SmtpProbe implements MailboxProbe {
     const key = `${host}#${turns % Math.max(1, this.opts.lanesFor?.(host) ?? 1)}`;
     const previous = this.lastByHost.get(key) ?? Promise.resolve();
     const turn = previous.then(async () => {
-      // Probes queued behind the one that met the listing need no connection either.
-      const heldThen = this.held(fleet);
+      // Probes queued behind the one that met the listing or the silence need no connection either.
+      const heldThen = this.held(fleet, host);
       if (heldThen) return heldThen;
       const outcome = await probeMailbox(email, {
         ...this.opts,
@@ -620,6 +630,12 @@ export class SmtpProbe implements MailboxProbe {
       });
       if (outcome.reason === "blocked" && outcome.transcript.some((x) => LISTED.test(x.reply)))
         this.listedUntil.set(fleet, this.now() + this.listedHoldMs);
+      // Every MX tried failed at connect (only `connect` lines): nobody there spoke to us.
+      if (
+        outcome.reason === "unreachable" &&
+        outcome.transcript.every((x) => x.reply.startsWith("connect "))
+      )
+        this.silentUntil.set(host, this.now() + this.silentHoldMs);
       await this.sleep(this.gapMs);
       return outcome;
     });
@@ -633,18 +649,22 @@ export class SmtpProbe implements MailboxProbe {
     return this.verdictOf(await turn);
   }
 
-  /** Listed at this fleet: asking renews the listing. The same verdict, no connection. */
-  private held(fleet: string): ProbeOutcome | null {
-    const until = this.listedUntil.get(fleet) ?? 0;
-    if (until <= this.now()) return null;
-    const reply = `held: ${fleet} lists our IP until ${new Date(until).toISOString()}`;
-    return {
-      result: "risky",
-      reason: "blocked",
-      mx: null,
-      code: null,
-      transcript: [{ sent: null, code: 0, reply }],
-    };
+  /**
+   * Listed at this fleet (asking renews the listing), or silent at this host: the same
+   * verdict, no connection.
+   */
+  private held(fleet: string, host: string): ProbeOutcome | null {
+    const now = this.now();
+    const listed = this.listedUntil.get(fleet) ?? 0;
+    if (listed > now)
+      return heldOutcome("blocked", `held: ${fleet} lists our IP until ${iso(listed)}`);
+    const silent = this.silentUntil.get(host) ?? 0;
+    if (silent > now)
+      return heldOutcome(
+        "unreachable",
+        `held: ${host} took no connection; again after ${iso(silent)}`,
+      );
+    return null;
   }
 
   private verdictOf(outcome: ProbeOutcome): Verdict {
@@ -659,4 +679,16 @@ export class SmtpProbe implements MailboxProbe {
       },
     };
   }
+}
+
+const iso = (ms: number) => new Date(ms).toISOString();
+
+function heldOutcome(reason: string, reply: string): ProbeOutcome {
+  return {
+    result: "risky",
+    reason,
+    mx: null,
+    code: null,
+    transcript: [{ sent: null, code: 0, reply }],
+  };
 }

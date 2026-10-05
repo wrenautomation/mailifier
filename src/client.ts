@@ -12,6 +12,11 @@ export class RemoteProbeError extends Error {
   override name = "RemoteProbeError";
 }
 
+/** The host gave no verdict in time: a slow mail server's queue, not a dead host. */
+export class RemoteProbeTimeout extends RemoteProbeError {
+  override name = "RemoteProbeTimeout";
+}
+
 export interface RemoteProbeSettings {
   /** Waits before each retry of a 429 "busy" (the server is at PROBE_MAX_IN_FLIGHT). */
   busyBackoffMs?: readonly number[];
@@ -61,6 +66,8 @@ export class RemoteProbe implements MailboxProbe {
         signal: AbortSignal.timeout(60_000),
       });
     } catch (err) {
+      if (err instanceof Error && err.name === "TimeoutError")
+        throw new RemoteProbeTimeout("probe host gave no verdict within 60s");
       // The token rides in a header, never in a message; keep the error to its name.
       throw new RemoteProbeError(
         `probe host unreachable: ${err instanceof Error ? err.name : "Error"}`,

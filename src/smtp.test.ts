@@ -415,6 +415,33 @@ describe("SmtpProbe", () => {
     expect(dials).toBe(2);
   });
 
+  it("leaves a host alone for an hour once none of its MX names takes a connection", async () => {
+    let clock = 0;
+    let dials = 0;
+    const probe = new SmtpProbe({
+      helo: "probe.test",
+      resolver: async (_name, type) =>
+        type === "MX" ? ["10 mx1.silent.example.", "20 mx2.silent.example."] : [],
+      random: () => "zz-random",
+      sleep: async () => {},
+      now: () => clock,
+      dial: async () => {
+        dials++;
+        throw Object.assign(new Error("connect timed out"), { name: "TimeoutError" });
+      },
+    });
+    const [first, queued] = await Promise.all([
+      probe.verify("jane@acme.example"),
+      probe.verify("bob@other-firm.example"),
+    ]);
+    expect(first).toMatchObject({ result: "risky", raw: { reason: "unreachable" } });
+    expect(queued).toMatchObject({ result: "risky", raw: { reason: "unreachable", mx: null } });
+    expect(dials).toBe(2);
+    clock = 3_600_001;
+    await probe.verify("bob@other-firm.example");
+    expect(dials).toBe(4);
+  });
+
   it("names the fleet an MX belongs to", () => {
     expect(fleetOf("mx0a-001.pphosted.com.")).toBe("pphosted.com");
     expect(fleetOf("mx.firm.co.uk")).toBe("firm.co.uk");
