@@ -7,7 +7,7 @@ MX lookup → connect on port 25 → `EHLO` → `STARTTLS` when offered → `MAI
 `RCPT TO <the address>` → `QUIT`. The server's answer to `RCPT` is the verdict. There is no `DATA`, so nothing
 is ever delivered.
 
-Zero runtime dependencies. Node 22+.
+One runtime dependency: tldts, for the public suffix list. Node 22+.
 
 ## Install
 

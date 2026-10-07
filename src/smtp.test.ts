@@ -52,6 +52,8 @@ const resolver: Resolver = async (name, type) => {
   if (type === "MX" && name === "acme.example")
     return ["20 mx2.acme.example.", "10 mx1.acme.example."];
   if (type === "MX" && name === "bare.example") return [];
+  if (type === "MX" && name === "nullmx.example") return ["0 ."];
+  if (type === "A" && name === "nullmx.example") return ["203.0.113.6"];
   if (type === "A" && name === "bare.example") return ["203.0.113.5"];
   return [];
 };
@@ -140,6 +142,18 @@ describe("mailHosts", () => {
   it("falls back to the A record, then nothing", async () => {
     expect(await mailHosts("bare.example", resolver)).toEqual(["bare.example"]);
     expect(await mailHosts("nowhere.example", resolver)).toEqual([]);
+  });
+  it("a null MX (RFC 7505) takes no mail: no A fallback, no probe", async () => {
+    expect(await mailHosts("nullmx.example", resolver)).toEqual([]);
+    let dials = 0;
+    const out = await probeMailbox("jane@nullmx.example", {
+      ...opts(async () => {
+        dials += 1;
+        throw new Error("never dialed");
+      }),
+    });
+    expect(out).toMatchObject({ result: "invalid", mx: null });
+    expect(dials).toBe(0);
   });
 });
 
@@ -446,6 +460,10 @@ describe("SmtpProbe", () => {
     expect(fleetOf("mx0a-001.pphosted.com.")).toBe("pphosted.com");
     expect(fleetOf("mx.firm.co.uk")).toBe("firm.co.uk");
     expect(fleetOf("mail.firm.ca")).toBe("firm.ca");
+    expect(fleetOf("mx-ha03.web.de")).toBe("web.de");
+    expect(fleetOf("mx00.gmx.net")).toBe("gmx.net");
+    expect(fleetOf("mx.firm.com.au")).toBe("firm.com.au");
+    expect(fleetOf("localhost")).toBe("localhost");
   });
 
   it("gives a big shared host several lanes, each with its own gap", async () => {

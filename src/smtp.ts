@@ -18,6 +18,7 @@
 import { randomBytes } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
 import { connect as tlsConnect } from "node:tls";
+import { getDomain } from "tldts";
 import { DohStatusError, resolve as dohResolve, type Resolver } from "./dns.js";
 import type { MailboxProbe, MailboxResult, Verdict } from "./verdict.js";
 
@@ -139,10 +140,13 @@ const enhanced = (reply: string) => /\b([245])\.(\d{1,3})\.(\d{1,3})\b/.exec(rep
 
 /**
  * MX hosts in priority order (lowest number first), falling back to the domain's own A
- * record when there is none, as mail does. Empty = nothing to connect to.
+ * record when there is none, as mail does. Empty = nothing to connect to, a null MX included.
  */
 export async function mailHosts(domain: string, resolver: Resolver): Promise<string[]> {
-  const mx = (await resolver(domain, "MX"))
+  const records = (await resolver(domain, "MX")).filter((rr) => rr.trim());
+  // RFC 7505 null MX ("0 ."): the domain takes no mail, so no A fallback.
+  if (records.length && records.every((rr) => /^\d+\s+\.?$/.test(rr.trim()))) return [];
+  const mx = records
     .map((rr) => {
       const [priority, host] = rr.trim().split(/\s+/);
       return { priority: Number(priority), host: (host ?? "").replace(/\.$/, "").toLowerCase() };
@@ -508,17 +512,13 @@ const LISTED =
   /blocked using|blocked by|blocklist|blacklist|ipcheck\.proofpoint|senderscore|spamhaus|barracuda|spamcop|sorbs/i;
 
 /**
- * The mail fleet an MX belongs to: its registrable domain ("mx1.pphosted.com" ->
- * "pphosted.com"), three labels under a two-letter country code with a short second
- * level ("mx.firm.co.uk" -> "firm.co.uk"). One listing covers every host of a fleet.
+ * The mail fleet an MX belongs to: its registrable domain by the public suffix list
+ * ("mx1.pphosted.com" -> "pphosted.com", "mx.firm.co.uk" -> "firm.co.uk",
+ * "mx-ha03.web.de" -> "web.de"). One listing covers every host of a fleet.
  */
 export function fleetOf(host: string): string {
-  const labels = host.toLowerCase().replace(/\.$/, "").split(".");
-  const ccSecondLevel =
-    labels.length >= 3 &&
-    (labels.at(-1) as string).length === 2 &&
-    (labels.at(-2) as string).length <= 3;
-  return labels.slice(ccSecondLevel ? -3 : -2).join(".");
+  const h = host.toLowerCase().replace(/\.$/, "");
+  return getDomain(h) ?? h;
 }
 
 /**
