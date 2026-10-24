@@ -30,7 +30,7 @@
     "prepare": "git config core.hooksPath .githooks || true && pnpm build && pnpm bundle",
     "typecheck": "tsc --noEmit",
     "test": "vitest run src",
-    "lint": "biome check .",
+    "lint": "biome check --error-on-warnings .",
     "prepublishOnly": "pnpm lint && pnpm typecheck && pnpm test"
   },
   "devDependencies": {
